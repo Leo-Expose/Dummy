@@ -82,6 +82,8 @@ LSB scan + embedded-file carving + PNG chunk audit.
 
 ### ✨ Key Features
 - **LSB Engine**: 1/2/4-bit planes × `r/g/b/a/rgb/bgr/rgba/abgr` × MSB-first + LSB-first byte orders (vectorized NumPy, 4M-value cap for speed).
+- **External zsteg passthrough (overpowered)**: runs `zsteg --all` when the binary exists — catches prime/interlace/palette cases native misses. Skipped gracefully if absent.
+- **Steghide extractor (overpowered)**: tries 20 passwords (`''`, `password`, `ctf`, `kju`, …) against JPG/BMP/WAV/AU in a tempdir (never CWD), scans the extracted payload. Skipped gracefully if absent.
 - **Carving**: `ZIP/7z/RAR/GZIP/BZIP2/PNG/JPEG/BMP/GIF/PDF/ELF/EXE/MP3/OGG/FLAC/RIFF/SQLite/PCAP` → `./extracted_stego/` (50MB cap per carve).
 - **PNG Chunks**: bounds-checked parser with CRC-mismatch warnings; flags non-standard chunks; reports trailing bytes after `IEND`.
 - **Safety**: 200MB input cap (`--force` to override), large-image downsample notice.
@@ -93,6 +95,14 @@ LSB scan + embedded-file carving + PNG chunk audit.
 ./stego.py --lsb-only target_image.png
 ./stego.py --carve-only mystery_file
 ./stego.py --loose target_image.png
+./stego.py --no-external target_image.png  # pure-Python only
+./stego.py --steghide-only photo.jpg       # steghide extractor only
+```
+
+### Optional external tools (extra coverage, safe to skip)
+```bash
+gem install zsteg          # PNG/BMP deep detectors
+sudo apt install steghide  # JPG/BMP/WAV/AU payloads
 ```
 
 ---

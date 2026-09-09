@@ -9,7 +9,10 @@ import os
 import re
 import base64
 import argparse
+import shutil
 import struct
+import subprocess
+import tempfile
 import numpy as np
 from PIL import Image, ImageFile
 
@@ -17,6 +20,15 @@ Image.MAX_IMAGE_PIXELS = 50_000_000
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 MAX_FILE_BYTES = 200 * 1024 * 1024
 MAX_CARVE_BYTES = 50 * 1024 * 1024
+MAX_EXTERNAL_OUTPUT = 200 * 1024  # 200KB cap on external tool stdout
+EXTERNAL_TIMEOUT = 60
+
+# Overpowered password list for steghide (early-round speedrun)
+STEGHIDE_PASSWORDS = [
+    '', 'password', '123456', 'ctf', 'flag', 'secret', 'admin', 'kju', 'KJU',
+    'password123', '1234', '0000', 'qwerty', 'letmein', 'welcome', 'pass',
+    'guest', 'ctf123', 'flag123', 'kju123',
+]
 
 # ANSI Terminal Colors
 class Colors:
@@ -312,6 +324,87 @@ def analyze_png_chunks(filepath):
         print(f"\n  {Colors.BOLD}{Colors.RED}🚨 TRAILING DATA AFTER IEND CHUNK!{Colors.RESET} ({trailing_bytes} bytes at offset {hex(offset)})")
         scan_text_for_flags(data[offset:offset + MAX_CARVE_BYTES].decode('utf-8', errors='ignore'), "PNG Trailing Bytes")
 
+# ─── 4. EXTERNAL OVERPOWERED HOOKS (zsteg + steghide, if installed) ─
+def _run_external(cmd, timeout=EXTERNAL_TIMEOUT):
+    """Run an external binary, return stdout+stderr truncated to cap. Never raises."""
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        out = (res.stdout or '') + (res.stderr or '')
+        if len(out) > MAX_EXTERNAL_OUTPUT:
+            out = out[:MAX_EXTERNAL_OUTPUT] + f"\n...[truncated {len(out)}B to {MAX_EXTERNAL_OUTPUT}B]"
+        return out
+    except subprocess.TimeoutExpired:
+        return "[TIMEOUT]"
+    except FileNotFoundError:
+        return "[TOOL NOT FOUND]"
+    except Exception as e:
+        return f"[ERROR: {e}]"
+
+def _is_png_or_bmp(filepath):
+    try:
+        with open(filepath, 'rb') as f:
+            head = f.read(16)
+        return head.startswith(b'\x89PNG\r\n\x1a\n') or head.startswith(b'BM') or \
+            filepath.lower().endswith(('.png', '.bmp'))
+    except Exception:
+        return False
+
+def analyze_external_zsteg(filepath):
+    print(f"\n{Colors.BOLD}{Colors.BLUE}⚡ 4. EXTERNAL ZSTEG PASSTHROUGH (overpowered){Colors.RESET}")
+    print("=" * 65)
+    if not shutil.which('zsteg'):
+        print("  ℹ️ zsteg binary not found — skipping (gem install zsteg for extra coverage). Native LSB scan above already ran.")
+        return
+    if not _is_png_or_bmp(filepath):
+        print("  ℹ️ Not PNG/BMP — skipping external zsteg.")
+        return
+    # --all covers every detector zsteg ships (b1-b8, rgb, rgba, prime, interlace, palette)
+    out = _run_external(['zsteg', '--all', filepath])
+    if out in ("[TIMEOUT]", "[TOOL NOT FOUND]") or not out.strip():
+        print(f"  ⚠️ zsteg produced no output ({out.strip()}).")
+        return
+    print(f"  {Colors.BOLD}zsteg --all output (capped):{Colors.RESET}")
+    for line in out.strip().splitlines()[:40]:
+        print(f"    {line[:300]}")
+    if len(out.strip().splitlines()) > 40:
+        print(f"    ... ({len(out.strip().splitlines())} lines total, capped display)")
+    scan_text_for_flags(out, "external zsteg --all")
+
+def analyze_steghide(filepath):
+    print(f"\n{Colors.BOLD}{Colors.BLUE}🕵️ 5. STEGHIDE EXTRACTOR (overpowered){Colors.RESET}")
+    print("=" * 65)
+    if not shutil.which('steghide'):
+        print("  ℹ️ steghide binary not found — skipping (apt install steghide for JPG/WAV coverage).")
+        return
+    if not filepath.lower().endswith(('.jpg', '.jpeg', '.bmp', '.wav', '.au')):
+        print("  ℹ️ steghide supports JPG/BMP/WAV/AU only — skipping.")
+        return
+    cracked = False
+    with tempfile.TemporaryDirectory(prefix='ctf_steghide_') as tmpdir:
+        for pwd in STEGHIDE_PASSWORDS:
+            out_path = os.path.join(tmpdir, 'extracted.bin')
+            if os.path.exists(out_path):
+                os.remove(out_path)
+            out = _run_external(['steghide', 'extract', '-sf', filepath, '-p', pwd,
+                                 '-xf', out_path, '-f'], timeout=30)
+            if 'wrote extracted data' in out.lower() and os.path.exists(out_path):
+                print(f"  {Colors.GREEN}✅ steghide password found: '{pwd or '(empty)'}'{Colors.RESET}")
+                try:
+                    size = os.path.getsize(out_path)
+                    if size > MAX_CARVE_BYTES:
+                        print(f"  ⚠️ Extracted payload {size}B exceeds cap, scanning first {MAX_CARVE_BYTES}B.")
+                    with open(out_path, 'rb') as f:
+                        payload = f.read(MAX_CARVE_BYTES).decode('utf-8', errors='ignore')
+                    scan_text_for_flags(payload, f"steghide payload (password='{pwd or '(empty)'}')")
+                    if not FLAG_REGEX.search(payload):
+                        print(f"     Payload preview (200 chars): {payload[:200]!r}")
+                except Exception as e:
+                    print(f"  ⚠️ Could not read extracted payload: {e}")
+                cracked = True
+                break  # one payload per file; stop for speed
+        if not cracked:
+            print("  ✓ steghide trial complete — no password yielded a payload.")
+
 # ─── MAIN DRIVER ─────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="CTF Steganography & Embedded Payload Analysis Tool (zsteg + binwalk)")
@@ -322,6 +415,8 @@ def main():
     parser.add_argument("--carve-only", action="store_true", help="Run only embedded carving scan (binwalk mode)")
     parser.add_argument("--loose", action="store_true", help="Loose flag matching (any prefix{...}); default is strict known-prefix matching")
     parser.add_argument("--force", action="store_true", help="Process files larger than safety cap")
+    parser.add_argument("--no-external", action="store_true", help="Skip external zsteg/steghide hooks (pure-Python only)")
+    parser.add_argument("--steghide-only", action="store_true", help="Run only the steghide extractor")
 
     args = parser.parse_args()
     global FLAG_REGEX
@@ -339,12 +434,20 @@ def main():
     print(f"{Colors.BOLD}{Colors.HEADER} 🕵️  CTF STEGANOGRAPHY & EMBEDDED FILE ANALYZER (zsteg/binwalk){Colors.RESET}")
     print(f"{Colors.BOLD}{Colors.HEADER}============================================================={Colors.RESET}")
 
-    if not args.carve_only:
-        analyze_lsb_stego(args.filepath, verbose=args.verbose)
-        analyze_png_chunks(args.filepath)
+    if args.steghide_only:
+        analyze_steghide(args.filepath)
+    else:
+        if not args.carve_only:
+            analyze_lsb_stego(args.filepath, verbose=args.verbose)
+            analyze_png_chunks(args.filepath)
+            if not args.no_external:
+                analyze_external_zsteg(args.filepath)
 
-    if not args.lsb_only:
-        analyze_binwalk_embedded(args.filepath, extract=args.extract)
+        if not args.lsb_only:
+            analyze_binwalk_embedded(args.filepath, extract=args.extract)
+
+        if not args.no_external:
+            analyze_steghide(args.filepath)
 
     print(f"\n{Colors.BOLD}{Colors.HEADER}============================================================={Colors.RESET}")
     print(f"{Colors.BOLD}{Colors.HEADER} 🏁 STEGO ANALYSIS SUMMARY{Colors.RESET}")
