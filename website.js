@@ -3,28 +3,34 @@
 // @namespace    Violentmonkey Scripts
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
-// @grant        GM_setClipboard
 // @grant        unsafeWindow
-// @version      1.0.0
+// @version      1.1.0
 // @author       Antigravity
-// @description  Automated scanner for capturing CTF flags across DOM text, hidden styles, comments, base64 strings, storage, cookies, scripts, and headers.
+// @description  Automated scanner for capturing CTF flags across DOM text, hidden styles, comments, base64 strings, storage, cookies, scripts, and headers. Enable only on CTF hosts.
 // @run-at       document-idle
+// @noframes
 // ==/UserScript==
 
 (function () {
     'use strict';
 
+    // TIP: enable only on your CTF host (Violentmonkey → match rules) to avoid
+    // running on every site. Set LOOSE_MODE=true for custom-prefix challenges.
+    const LOOSE_MODE = false;
+
     // Target window object (unsafeWindow for Violentmonkey sandbox, or fallback to window)
     const targetWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
-    // Universal Flag Pattern: Matches ANY prefix (e.g. HTB{...}, picoCTF{...}, THM{...}, custom_flag{...})
-    const GENERIC_BRACED_FLAG_REGEX = /[A-Za-z0-9_\-]{1,25}\{[^}\s\r\n]+\}/gi;
+    // Strict by default (known prefixes, low FP for early rounds).
+    const STRICT_FLAG_SRC = '(?:flag|ctf|picoCTF|HTB|THM|kju|CHTB|SEKAI|UIUCTF|PatriotCTF)\\{[^}\\r\\n]{1,200}\\}';
+    const LOOSE_FLAG_SRC = '[A-Za-z0-9_\\-]{3,25}\\{[A-Za-z0-9_\\-!@#$%^&*()+=~`|:\\;"\'<>,.?/\\\\ \\[\\]]{1,200}\\}';
+    const FLAG_SRC = LOOSE_MODE ? LOOSE_FLAG_SRC : STRICT_FLAG_SRC;
+    function flagRegex() { return new RegExp(FLAG_SRC, 'gi'); }
 
-    // Optional Hex Hashes & UUID flag patterns (MD5 / SHA256 / UUID)
+    // UUIDs are hints, not flags (separate console group to cut noise)
     const UUID_REGEX = /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/gi;
-    const SHA256_REGEX = /\b[a-fA-F0-9]{64}\b/gi;
 
-    const B64_CANDIDATE_REGEX = /[A-Za-z0-9+/]{8,}={0,2}/g;
+    const B64_CANDIDATE_REGEX = /[A-Za-z0-9+/]{16,}={0,2}/g;
 
     let discoveredFlags = new Map(); // key: flag string, value: { category, location, raw }
 
@@ -39,41 +45,45 @@
         }
     }
 
-    // Helper: Extract plain flags from text
+    // Helper: Extract plain flags from text (strict; UUIDs logged as hints only)
     function findFlags(text) {
         if (typeof text !== 'string') return [];
-        let results = [];
-        
-        // 1. Generic Braced Flags (matches ANY_PREFIX{...})
-        const braced = text.match(GENERIC_BRACED_FLAG_REGEX);
-        if (braced) results.push(...braced);
-
-        // 2. UUID Formats
+        const braced = text.match(flagRegex());
+        const out = braced ? Array.from(new Set(braced)) : [];
         const uuids = text.match(UUID_REGEX);
-        if (uuids) results.push(...uuids);
-
-        // 3. SHA-256 Hashes
-        const hashes = text.match(SHA256_REGEX);
-        if (hashes) results.push(...hashes);
-
-        return Array.from(new Set(results));
+        if (uuids) {
+            for (const u of new Set(uuids)) {
+                console.log(`%c[HINT] [uuid] %c${u}`, 'color: #ffaa00; font-weight: bold;', 'color: #bbbbbb;');
+            }
+        }
+        return out;
     }
 
-    // Helper: Extract Base64 encoded flags
+    function isValidB64(s) {
+        if (s.length < 16 || s.length % 4 === 1) return false;
+        try {
+            const dec = atob(s);
+            // round-trip: re-encode must match (ignoring padding)
+            const re = btoa(dec).replace(/=+$/, '');
+            return re === s.replace(/=+$/, '');
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // Helper: Extract Base64 encoded flags (validated round-trip only)
     function findBase64Flags(text) {
-        if (typeof text !== 'string') return [];
-        const candidates = text.match(B64_CANDIDATE_REGEX) || [];
+        if (typeof text !== 'string' || text.length < 16) return [];
+        const candidates = new Set(text.match(B64_CANDIDATE_REGEX) || []);
         const found = [];
 
         for (const candidate of candidates) {
             try {
-                // Normalize base64 padding
-                let padCandidate = candidate;
-                while (padCandidate.length % 4 !== 0) padCandidate += '=';
-
-                const decoded = atob(padCandidate);
-                const flags = findFlags(decoded);
-                for (const flag of flags) {
+                if (!isValidB64(candidate)) continue;
+                const decoded = atob(candidate);
+                if (!/[\x20-\x7E]{4,}/.test(decoded)) continue;
+                const flags = decoded.match(flagRegex()) || [];
+                for (const flag of new Set(flags)) {
                     found.push({ flag, encoded: candidate });
                 }
             } catch (e) {
@@ -195,6 +205,17 @@
                 findFlags(content).forEach(f => logFlag(f, 'Script Tag', 'Inline <script>'));
                 findBase64Flags(content).forEach(item => logFlag(item.flag, 'Base64 Script', `Encoded: ${item.encoded}`));
             }
+            // external script source-map hint (common in small web CTFs)
+            const src = script.getAttribute && script.getAttribute('src');
+            if (src && /\.js($|\?)/.test(src)) {
+                const mapUrl = src + '.map';
+                fetch(mapUrl, { method: 'GET' }).then(r => r.ok ? r.text() : '').then(t => {
+                    if (t) {
+                        findFlags(t).forEach(f => logFlag(f, 'SourceMap', mapUrl));
+                        findBase64Flags(t).forEach(item => logFlag(item.flag, 'Base64 SourceMap', mapUrl));
+                    }
+                }).catch(() => {});
+            }
         });
 
         // Scan custom global properties attached to window/unsafeWindow
@@ -214,12 +235,51 @@
                 if (standardProps.has(key) || key.startsWith('webkit') || key.startsWith('chrome')) continue;
                 try {
                     const val = targetWindow[key];
-                    if (typeof val === 'string') {
-                        findFlags(val).forEach(f => logFlag(f, 'JS Global Variable', `window.${key}`));
-                        findBase64Flags(val).forEach(item => logFlag(item.flag, 'Base64 JS Global', `window.${key}`));
+                    let sval = '';
+                    if (typeof val === 'string') sval = val;
+                    else if (val && typeof val === 'object') {
+                        try { sval = JSON.stringify(val).slice(0, 20000); } catch (e) { continue; }
+                    } else continue;
+                    if (sval) {
+                        findFlags(sval).forEach(f => logFlag(f, 'JS Global Variable', `window.${key}`));
+                        findBase64Flags(sval).forEach(item => logFlag(item.flag, 'Base64 JS Global', `window.${key}`));
                     }
                 } catch (e) {}
             }
+        } catch (e) {}
+    }
+
+    // 4b. Hook fetch/XHR to scan async API responses (React/SPA flags)
+    function hookNetwork() {
+        const scanBody = (text, where) => {
+            if (typeof text !== 'string' || !text) return;
+            findFlags(text).forEach(f => logFlag(f, 'Network Response', where));
+            findBase64Flags(text).forEach(item => logFlag(item.flag, 'Base64 Network', `${where} Encoded: ${item.encoded}`));
+        };
+        try {
+            const origFetch = window.fetch;
+            if (origFetch) {
+                window.fetch = function (...args) {
+                    return origFetch.apply(this, args).then(res => {
+                        try {
+                            const clone = res.clone();
+                            clone.text().then(t => scanBody(t.slice(0, 200000), String(args[0]).slice(0, 120))).catch(() => {});
+                        } catch (e) {}
+                        return res;
+                    });
+                };
+            }
+        } catch (e) {}
+        try {
+            const origOpen = XMLHttpRequest.prototype.open;
+            const origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function (m, u, ...rest) { this._ctfUrl = u; return origOpen.call(this, m, u, ...rest); };
+            XMLHttpRequest.prototype.send = function (...args) {
+                this.addEventListener('load', function () {
+                    try { scanBody(String(this.responseText || '').slice(0, 200000), String(this._ctfUrl || 'XHR').slice(0, 120)); } catch (e) {}
+                });
+                return origSend.apply(this, args);
+            };
         } catch (e) {}
     }
 
@@ -269,16 +329,38 @@
     }
 
     // Run all scanning functions
+    let debounceTimer = null;
+    function rescan(reason) {
+        scanDOM();
+        scanComments();
+        scanStorage();
+        scanScriptsAndGlobals();
+        targetWindow.discoveredFlags = discoveredFlags;
+        if (discoveredFlags.size > 0) {
+            console.log(`%c[+] [${reason}] Total Flags: ${discoveredFlags.size}. Type 'discoveredFlags' to view.`, 'color: #ffff00; font-weight: bold;');
+        }
+    }
     function initScanner() {
-        console.log('%c[+] CTF Flag Scanner Suite Activated...', 'color: #00ff00; font-weight: bold;');
+        console.log('%c[+] CTF Flag Scanner Suite Activated (strict mode)...', 'color: #00ff00; font-weight: bold;');
         scanDOM();
         scanComments();
         scanStorage();
         scanScriptsAndGlobals();
         scanHeaders();
+        hookNetwork();
+
+        // Re-scan on SPA/DOM mutations (debounced 800ms)
+        try {
+            const obs = new MutationObserver(() => {
+                clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(() => rescan('mutation'), 800);
+            });
+            obs.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+        } catch (e) {}
 
         // Expose flags map to targetWindow for console access
         targetWindow.discoveredFlags = discoveredFlags;
+        targetWindow.CTF_rescan = () => rescan('manual');
         if (discoveredFlags.size > 0) {
             console.log(`%c[+] Total Flags Found: ${discoveredFlags.size}. Type 'discoveredFlags' in console to view all.`, 'color: #ffff00; font-weight: bold;');
         }

@@ -11,7 +11,12 @@ import base64
 import argparse
 import struct
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFile
+
+Image.MAX_IMAGE_PIXELS = 50_000_000
+ImageFile.LOAD_TRUNCATED_IMAGES = False
+MAX_FILE_BYTES = 200 * 1024 * 1024
+MAX_CARVE_BYTES = 50 * 1024 * 1024
 
 # ANSI Terminal Colors
 class Colors:
@@ -24,9 +29,12 @@ class Colors:
     RESET = '\033[0m'
     BOLD = '\033[1m'
 
-# Universal Flag Regex Patterns
-FLAG_REGEX = re.compile(r'[A-Za-z0-9_\-]{1,25}\{[^}\s\r\n]+\}', re.IGNORECASE)
-B64_REGEX = re.compile(r'[A-Za-z0-9+/]{12,}={0,2}')
+# Flag patterns: strict by default, --loose for any prefix
+STRICT_PREFIXES = r'(?:flag|ctf|picoCTF|HTB|THM|kju|CHTB|SEKAI|UIUCTF|PatriotCTF)'
+STRICT_FLAG_REGEX = re.compile(STRICT_PREFIXES + r'\{[^}\r\n]{1,200}\}', re.IGNORECASE)
+LOOSE_FLAG_REGEX = re.compile(r'[A-Za-z0-9_\-]{3,25}\{[A-Za-z0-9_\-!@#$%^&*()+=~`|:;\"\'<>,.?/\\ \[\]]{1,200}\}')
+FLAG_REGEX = STRICT_FLAG_REGEX
+B64_REGEX = re.compile(r'[A-Za-z0-9+/]{16,}={0,2}')
 
 # Comprehensive Binary Signatures for Carving (binwalk equivalent)
 FILE_SIGNATURES = [
@@ -47,16 +55,29 @@ FILE_SIGNATURES = [
     (b'OggS', 'OGG Audio/Video Container', '.ogg'),
     (b'fLaC', 'FLAC Lossless Audio', '.flac'),
     (b'RIFF', 'RIFF Media Container (WAV/WEBP/AVI)', '.riff'),
+    (b'SQLite format 3\x00', 'SQLite Database', '.db'),
+    (b'\xd4\xc3\xb2\xa1', 'PCAP Capture', '.pcap'),
+    (b'\x0a\x0d\x0d\x0a', 'PCAP-NG Capture', '.pcapng'),
 ]
 
 discovered_flags = []
 
 def log_flag(flag, source):
+    if any(e['flag'] == flag for e in discovered_flags):
+        return
     entry = {'flag': flag, 'source': source}
-    if entry not in discovered_flags:
-        discovered_flags.append(entry)
-        print(f"  {Colors.BOLD}{Colors.GREEN}🚩 FOUND FLAG:{Colors.RESET} {Colors.CYAN}{flag}{Colors.RESET}")
-        print(f"     {Colors.YELLOW}Source:{Colors.RESET} {source}\n")
+    discovered_flags.append(entry)
+    print(f"  {Colors.BOLD}{Colors.GREEN}🚩 FOUND FLAG:{Colors.RESET} {Colors.CYAN}{flag}{Colors.RESET}")
+    print(f"     {Colors.YELLOW}Source:{Colors.RESET} {source}\n")
+
+def _is_valid_b64(s):
+    try:
+        if len(s) < 16 or len(s) % 4 == 1:
+            return False
+        dec = base64.b64decode(s, validate=True)
+        return base64.b64encode(dec).decode().rstrip('=') == s.rstrip('=')
+    except Exception:
+        return False
 
 def scan_text_for_flags(text, source_tag):
     if not text:
@@ -66,31 +87,60 @@ def scan_text_for_flags(text, source_tag):
 
     for b64 in B64_REGEX.findall(text):
         try:
-            pad = b64 + '=' * ((4 - len(b64) % 4) % 4)
-            decoded = base64.b64decode(pad).decode('utf-8', errors='ignore')
+            if not _is_valid_b64(b64):
+                continue
+            decoded = base64.b64decode(b64).decode('utf-8', errors='ignore')
+            if not re.search(r'[\x20-\x7E]{4,}', decoded):
+                continue
             for df in FLAG_REGEX.findall(decoded):
                 log_flag(df, f"Base64 Decoded ({b64[:16]}...) in {source_tag}")
         except Exception:
             pass
 
 # ─── 1. ZSTEG / LSB STEGANOGRAPHY ENGINE ───────────────────────────
+def _bits_to_bytes(vals, bit_depth, lsb_first=False):
+    """Convert array of d-bit values to bytes. Tries both MSB-first and LSB-first byte orders."""
+    vals = np.asarray(vals, dtype=np.uint8).ravel()
+    # Build bitstream MSB-first within each value
+    shifts = list(range(bit_depth - 1, -1, -1))
+    bits = np.concatenate([((vals >> s) & 1).astype(np.uint8) for s in shifts]) if len(vals) else np.array([], dtype=np.uint8)
+    # Trim to whole bytes
+    nbytes = len(bits) // 8
+    if nbytes == 0:
+        return b''
+    bits = bits[:nbytes * 8].reshape(nbytes, 8)
+    if lsb_first:
+        bits = bits[:, ::-1]  # reverse bit order within each byte
+    packed = np.packbits(bits, axis=1).tobytes()
+    # np.packbits on 2D packs along axis=1 -> one byte per row
+    if isinstance(packed, bytes):
+        # packbits(axis=1) returns shape (nbytes,1); flatten
+        arr = np.frombuffer(packed, dtype=np.uint8)
+        return arr.tobytes()
+    return bytes(packed)
+
 def analyze_lsb_stego(filepath, verbose=False):
     print(f"\n{Colors.BOLD}{Colors.BLUE}🎨 1. LSB (LEAST SIGNIFICANT BIT) STEGANOGRAPHY SCAN (zsteg){Colors.RESET}")
     print("=" * 65)
 
     try:
-        img = Image.open(filepath)
+        with Image.open(filepath) as _probe:
+            _probe.load()
+            img_format = _probe.format
+            img = _probe.convert('RGBA')
+            arr = np.array(img)
     except Exception as e:
         print(f"  ℹ️ File is not a valid image or cannot be opened by PIL ({e}). Skipping LSB scan.\n")
         return
 
-    img = img.convert('RGBA')
-    arr = np.array(img)
     height, width, channels = arr.shape
-    print(f"  {Colors.BOLD}Image Format:{Colors.RESET} {img.format}, Dimensions: {width}x{height}, Mode: {img.mode}")
+    total_px = width * height
+    if total_px * channels > 100_000_000:
+        print(f"  ⚠️ Large image ({width}x{height}), scanning first 25M pixels for speed.")
+        arr = arr[: min(height, 5000), : min(width, 5000), :]
+        height, width, channels = arr.shape
+    print(f"  {Colors.BOLD}Image Format:{Colors.RESET} {img_format}, Dimensions: {width}x{height}, Mode: RGBA")
 
-    # Channel indices: R=0, G=1, B=2, A=3
-    channel_map = {'r': 0, 'g': 1, 'b': 2, 'a': 3}
     channel_combos = [
         ('r', [0]), ('g', [1]), ('b', [2]), ('a', [3]),
         ('rgb', [0, 1, 2]), ('bgr', [2, 1, 0]),
@@ -99,54 +149,45 @@ def analyze_lsb_stego(filepath, verbose=False):
 
     bits_found_count = 0
 
-    # Scan 1-bit, 2-bit, and 4-bit LSBs across channels
+    # Scan 1-bit, 2-bit, and 4-bit LSBs across channels, both byte orders
     for bit_depth in [1, 2, 4]:
         mask = (1 << bit_depth) - 1
         for name, ch_list in channel_combos:
             try:
-                # Extract pixel channel bits
-                extracted_bits = []
-                for ch in ch_list:
-                    ch_data = arr[:, :, ch]
-                    channel_bits = ch_data & mask
-                    extracted_bits.append(channel_bits)
+                vals = np.concatenate([(arr[:, :, ch] & mask).ravel() for ch in ch_list])
+                # Cap stream to ~4M values for speed (≈500KB decoded) — full for typical CTFs
+                if len(vals) > 4_000_000:
+                    vals = vals[:4_000_000]
+                for order_name, lsb_first in (('msb', False), ('lsb', True)):
+                    byte_data = _bits_to_bytes(vals, bit_depth, lsb_first=lsb_first)
+                    if not byte_data:
+                        continue
+                    # Null-terminate at first 0x00 run like zsteg does for preview, but scan full
+                    text = byte_data.decode('utf-8', errors='ignore')
+                    combo_tag = f"LSB {bit_depth}-bit ({name},{order_name})"
 
-                # Stack and flatten bits (row-by-row)
-                stacked = np.dstack(extracted_bits).flatten()
-                
-                # Convert bit values to bytes
-                if bit_depth == 1:
-                    byte_data = np.packbits(stacked).tobytes()
-                else:
-                    # Multi-bit LSB packing
-                    bit_str = ''.join([bin(val)[2:].zfill(bit_depth) for val in stacked[:20000]])
-                    byte_chunks = [int(bit_str[i:i+8], 2) for i in range(0, len(bit_str)-8, 8)]
-                    byte_data = bytes(byte_chunks)
+                    # Check flags
+                    flags_found = FLAG_REGEX.findall(text)
+                    if flags_found:
+                        bits_found_count += len(flags_found)
+                        for f in flags_found:
+                            log_flag(f, f"zsteg LSB Analysis -> {combo_tag}")
 
-                text = byte_data.decode('utf-8', errors='ignore')
-                combo_tag = f"LSB {bit_depth}-bit ({name})"
+                    # Check Base64 candidates inside LSB (validated only)
+                    for b64 in B64_REGEX.findall(text):
+                        try:
+                            if not _is_valid_b64(b64):
+                                continue
+                            decoded = base64.b64decode(b64).decode('utf-8', errors='ignore')
+                            for df in FLAG_REGEX.findall(decoded):
+                                bits_found_count += 1
+                                log_flag(df, f"Base64 in zsteg LSB Analysis -> {combo_tag}")
+                        except Exception:
+                            pass
 
-                # Check flags
-                flags_found = FLAG_REGEX.findall(text)
-                if flags_found:
-                    bits_found_count += len(flags_found)
-                    for f in flags_found:
-                        log_flag(f, f"zsteg LSB Analysis -> {combo_tag}")
-
-                # Check Base64 candidates inside LSB
-                for b64 in B64_REGEX.findall(text):
-                    try:
-                        pad = b64 + '=' * ((4 - len(b64) % 4) % 4)
-                        decoded = base64.b64decode(pad).decode('utf-8', errors='ignore')
-                        for df in FLAG_REGEX.findall(decoded):
-                            bits_found_count += 1
-                            log_flag(df, f"Base64 in zsteg LSB Analysis -> {combo_tag}")
-                    except Exception:
-                        pass
-
-                if verbose:
-                    printable = ''.join([c if 32 <= ord(c) <= 126 else '.' for c in text[:60]])
-                    print(f"  [{combo_tag:<18}] -> {printable}")
+                    if verbose:
+                        printable = ''.join([c if 32 <= ord(c) <= 126 else '.' for c in text[:60]])
+                        print(f"  [{combo_tag:<22}] -> {printable}")
 
             except Exception:
                 pass
@@ -160,7 +201,7 @@ def analyze_binwalk_embedded(filepath, extract=False):
     print("=" * 65)
 
     with open(filepath, 'rb') as f:
-        data = f.read()
+        data = f.read(MAX_FILE_BYTES)
 
     file_size = len(data)
     print(f"  {Colors.BOLD}Target File Size:{Colors.RESET} {file_size} bytes ({hex(file_size)})")
@@ -195,15 +236,15 @@ def analyze_binwalk_embedded(filepath, extract=False):
         text_sub = sub_data.decode('utf-8', errors='ignore')
         scan_text_for_flags(text_sub, f"Binwalk offset {hex(offset)} ({desc})")
 
-        # Auto Extract / Carve if requested
+        # Auto Extract / Carve if requested (capped)
         if extract and not is_primary:
-            out_dir = os.path.join(os.path.dirname(filepath), "extracted_stego")
+            out_dir = os.path.join(os.path.dirname(os.path.abspath(filepath)), "extracted_stego")
             os.makedirs(out_dir, exist_ok=True)
             carved_filename = f"carved_at_{hex(offset)}_{idx}{ext}"
             carved_path = os.path.join(out_dir, carved_filename)
-            
+
             with open(carved_path, 'wb') as carved_file:
-                carved_file.write(data[offset:])
+                carved_file.write(data[offset:offset + MAX_CARVE_BYTES])
             print(f"     {Colors.GREEN}↳ Carved & saved to: {carved_path}{Colors.RESET}")
 
 # ─── 3. PNG CHUNK STRUCTURE INSPECTION ──────────────────────────────
@@ -212,29 +253,53 @@ def analyze_png_chunks(filepath):
     print("=" * 65)
 
     with open(filepath, 'rb') as f:
-        data = f.read()
+        data = f.read(MAX_FILE_BYTES)
 
     if not data.startswith(b'\x89PNG\r\n\x1a\n'):
         print("  ℹ️ Not a PNG file. Skipping PNG chunk inspection.\n")
         return
 
     offset = 8
-    chunks = []
-    standard_chunks = {'IHDR', 'PLTE', 'IDAT', 'IEND', 'tRNS', 'cHRM', 'gAMA', 'iCCP', 'sBIT', 'sRGB', 'tEXt', 'zTXt', 'iTXt', 'bKGD', 'hIST', 'pHYs', 'tIME'}
+    standard_chunks = {'IHDR', 'PLTE', 'IDAT', 'IEND', 'tRNS', 'cHRM', 'gAMA', 'iCCP', 'sBIT', 'sRGB',
+                       'tEXt', 'zTXt', 'iTXt', 'bKGD', 'hIST', 'pHYs', 'tIME', 'eXIf', 'sCAL', 'sPLT', 'acTL', 'fcTL', 'fdAT'}
 
     print(f"  {'CHUNK':<10} {'OFFSET':<12} {'LENGTH':<10} {'STATUS':<20}")
     print(f"  {'-'*10} {'-'*12} {'-'*10} {'-'*20}")
 
+    import binascii
     while offset < len(data):
         if offset + 8 > len(data):
+            print(f"  ⚠️ Truncated chunk header at {hex(offset)}, stopping.")
             break
-        length = struct.unpack('>I', data[offset:offset+4])[0]
-        chunk_type = data[offset+4:offset+8].decode('utf-8', errors='ignore')
-        
+        try:
+            length = struct.unpack('>I', data[offset:offset+4])[0]
+        except struct.error:
+            print(f"  ⚠️ Corrupt chunk length at {hex(offset)}, stopping.")
+            break
+        if length > len(data):
+            print(f"  ⚠️ Absurd chunk length {length} at {hex(offset)}, stopping.")
+            break
+        if offset + 12 + length > len(data):
+            print(f"  ⚠️ Truncated chunk data at {hex(offset)} (need {length}B), stopping.")
+            break
+        try:
+            chunk_type = data[offset+4:offset+8].decode('ascii')
+        except Exception:
+            print(f"  ⚠️ Non-ASCII chunk type at {hex(offset)}, stopping.")
+            break
+        if not re.fullmatch(r'[A-Za-z]{4}', chunk_type):
+            print(f"  ⚠️ Invalid chunk type {chunk_type!r} at {hex(offset)}, stopping.")
+            break
+
         status = "Standard" if chunk_type in standard_chunks else f"{Colors.RED}NON-STANDARD / CUSTOM{Colors.RESET}"
         print(f"  {chunk_type:<10} {hex(offset):<12} {length:<10} {status:<20}")
 
         chunk_data = data[offset+8:offset+8+length]
+        # CRC check (warn only, don't abort — CTFs sometimes break CRC)
+        stored_crc = struct.unpack('>I', data[offset+8+length:offset+12+length])[0]
+        calc_crc = binascii.crc32(data[offset+4:offset+8+length]) & 0xffffffff
+        if stored_crc != calc_crc:
+            print(f"     {Colors.YELLOW}⚠️ CRC mismatch (stored {stored_crc:08x} vs calc {calc_crc:08x}){Colors.RESET}")
         scan_text_for_flags(chunk_data.decode('utf-8', errors='ignore'), f"PNG Chunk [{chunk_type}] at {hex(offset)}")
 
         offset += 12 + length  # Length (4) + Type (4) + Data (N) + CRC (4)
@@ -245,7 +310,7 @@ def analyze_png_chunks(filepath):
     if offset < len(data):
         trailing_bytes = len(data) - offset
         print(f"\n  {Colors.BOLD}{Colors.RED}🚨 TRAILING DATA AFTER IEND CHUNK!{Colors.RESET} ({trailing_bytes} bytes at offset {hex(offset)})")
-        scan_text_for_flags(data[offset:].decode('utf-8', errors='ignore'), "PNG Trailing Bytes")
+        scan_text_for_flags(data[offset:offset + MAX_CARVE_BYTES].decode('utf-8', errors='ignore'), "PNG Trailing Bytes")
 
 # ─── MAIN DRIVER ─────────────────────────────────────────────────
 def main():
@@ -255,11 +320,19 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help="Print verbose LSB bitstream analysis")
     parser.add_argument("--lsb-only", action="store_true", help="Run only LSB stego scan (zsteg mode)")
     parser.add_argument("--carve-only", action="store_true", help="Run only embedded carving scan (binwalk mode)")
+    parser.add_argument("--loose", action="store_true", help="Loose flag matching (any prefix{...}); default is strict known-prefix matching")
+    parser.add_argument("--force", action="store_true", help="Process files larger than safety cap")
 
     args = parser.parse_args()
+    global FLAG_REGEX
+    if args.loose:
+        FLAG_REGEX = LOOSE_FLAG_REGEX
 
     if not os.path.exists(args.filepath):
         print(f"{Colors.RED}❌ Error: File '{args.filepath}' does not exist.{Colors.RESET}")
+        sys.exit(1)
+    if not args.force and os.path.getsize(args.filepath) > MAX_FILE_BYTES:
+        print(f"{Colors.RED}❌ File exceeds {MAX_FILE_BYTES}B safety cap. Re-run with --force.{Colors.RESET}")
         sys.exit(1)
 
     print(f"\n{Colors.BOLD}{Colors.HEADER}============================================================={Colors.RESET}")
