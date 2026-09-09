@@ -141,9 +141,10 @@ def scan_text_for_flags(text, source_tag):
 def _bits_to_bytes(vals, bit_depth, lsb_first=False):
     """Convert array of d-bit values to bytes. Tries both MSB-first and LSB-first byte orders."""
     vals = np.asarray(vals, dtype=np.uint8).ravel()
-    # Build bitstream MSB-first within each value
+    # Per-value bits MSB-first, values in given (pixel-interleaved) order
     shifts = list(range(bit_depth - 1, -1, -1))
-    bits = np.concatenate([((vals >> s) & 1).astype(np.uint8) for s in shifts]) if len(vals) else np.array([], dtype=np.uint8)
+    bits = np.stack([((vals >> s) & 1).astype(np.uint8) for s in shifts], axis=-1).reshape(-1) \
+        if len(vals) else np.array([], dtype=np.uint8)
     # Trim to whole bytes
     nbytes = len(bits) // 8
     if nbytes == 0:
@@ -194,7 +195,10 @@ def analyze_lsb_stego(filepath, verbose=False):
         mask = (1 << bit_depth) - 1
         for name, ch_list in channel_combos:
             try:
-                vals = np.concatenate([(arr[:, :, ch] & mask).ravel() for ch in ch_list])
+                # Per-pixel interleaved channel values (true zsteg order:
+                # R,G,B,R,G,B... not all-R then all-G). Single-channel
+                # combos are unaffected (identical to ravel).
+                vals = np.stack([(arr[:, :, ch] & mask) for ch in ch_list], axis=-1).reshape(-1)
                 # Cap stream to ~4M values for speed (≈500KB decoded) — full for typical CTFs
                 if len(vals) > 4_000_000:
                     vals = vals[:4_000_000]
