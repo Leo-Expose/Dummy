@@ -13,7 +13,7 @@ FLAG_PATTERNS = [
     r'[A-Za-z0-9_]{2,10}\{[A-Za-z0-9_\-!@#$%^&*=+.?\/\\]+\}',
 ]
 COMBINED = re.compile('|'.join(FLAG_PATTERNS))
-BASE64_RE = re.compile(r'[A-Za-z0-9+/]{20,}={0,2}')
+BASE64_RE = re.compile(r'[A-Za-z0-9+/]{8,}={0,2}')
 
 found_flags = []
 
@@ -26,18 +26,44 @@ def header(title):
 def find_flags(text, source):
     matches = COMBINED.findall(text)
     for m in matches:
+        if any(e['flag'] == m for e in found_flags):
+            continue
         entry = {'flag': m, 'source': source}
-        if entry not in found_flags:
-            found_flags.append(entry)
-            print(f"  🚩 FLAG FOUND: {m}")
-            print(f"     Source    : {source}")
+        found_flags.append(entry)
+        print(f"  🚩 FLAG FOUND: {m}")
+        print(f"     Source    : {source}")
+
+def _pad_b64(s):
+    return s + '=' * ((-len(s)) % 4)
+
+def _is_valid_b64(s):
+    try:
+        if len(s) < 8 or len(s) % 4 == 1:
+            return False
+        dec = base64.b64decode(_pad_b64(s), validate=True)
+        return base64.b64encode(dec).decode().rstrip('=') == s.rstrip('=')
+    except Exception:
+        return False
 
 def try_base64(text, source):
-    for match in BASE64_RE.findall(text):
+    for match in set(BASE64_RE.findall(text)):
         try:
-            decoded = base64.b64decode(match + '==').decode('utf-8', errors='ignore')
-            if len(decoded) > 4 and decoded.isprintable():
-                find_flags(decoded, f"Base64 in {source}")
+            if not _is_valid_b64(match):
+                continue
+            cur, seen = match, {match}
+            for _ in range(3):  # up to 3 nested layers
+                decoded = base64.b64decode(_pad_b64(cur)).decode('utf-8', errors='ignore')
+                if len(decoded) > 4 and decoded.isprintable():
+                    find_flags(decoded, f"Base64 in {source}")
+                nxt = None
+                for cand in set(BASE64_RE.findall(decoded)):
+                    if cand not in seen and _is_valid_b64(cand):
+                        nxt = cand
+                        break
+                if nxt is None:
+                    break
+                seen.add(nxt)
+                cur = nxt
         except:
             pass
 

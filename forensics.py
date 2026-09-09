@@ -43,7 +43,7 @@ FLAG_REGEX = STRICT_FLAG_REGEX
 UUID_REGEX = re.compile(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b')
 SHA256_REGEX = re.compile(r'\b[a-fA-F0-9]{64}\b')
 MD5_REGEX = re.compile(r'\b[a-fA-F0-9]{32}\b')
-B64_REGEX = re.compile(r'[A-Za-z0-9+/]{16,}={0,2}')
+B64_REGEX = re.compile(r'[A-Za-z0-9+/]{8,}={0,2}')
 
 # Magic Byte Signatures for Common File Types
 MAGIC_SIGNATURES = [
@@ -88,14 +88,40 @@ def log_flag(flag, source):
 def log_hint(hint, source):
     print(f"  {Colors.YELLOW}💡 HINT ({source}):{Colors.RESET} {hint}")
 
+def _pad_b64(s):
+    return s + '=' * ((-len(s)) % 4)
+
 def _is_valid_b64(s):
     try:
-        if len(s) < 16 or len(s) % 4 == 1:
+        s = re.sub(r'\s+', '', s)
+        if len(s) < 8 or len(s) % 4 == 1:
             return False
-        dec = base64.b64decode(s, validate=True)
+        dec = base64.b64decode(_pad_b64(s), validate=True)
         return base64.b64encode(dec).decode().rstrip('=') == s.rstrip('=')
     except Exception:
         return False
+
+def _b64_decode_layers(token, max_layers=3):
+    """Yield (layer, decoded_text) by recursively base64-decoding a token."""
+    seen = {token}
+    cur = token
+    for layer in range(1, max_layers + 1):
+        try:
+            txt = base64.b64decode(_pad_b64(cur), validate=True).decode('utf-8', errors='ignore')
+        except Exception:
+            break
+        yield layer, txt
+        if not re.search(r'[\x20-\x7E]{4,}', txt):
+            break
+        nxt = None
+        for cand in set(B64_REGEX.findall(txt)):
+            if cand not in seen and _is_valid_b64(cand):
+                nxt = cand
+                break
+        if nxt is None:
+            break
+        seen.add(nxt)
+        cur = nxt
 
 def check_flags_in_text(text, source_name):
     if not text:
@@ -112,17 +138,19 @@ def check_flags_in_text(text, source_name):
     for h in MD5_REGEX.findall(text):
         log_hint(h, source_name + " [md5]")
 
-    # Check Base64 candidates inside text (validated round-trip only)
-    for b64_match in B64_REGEX.findall(text):
+    # Check Base64 candidates inside text (validated round-trip, recursive layers)
+    for b64_match in set(B64_REGEX.findall(text)):
         try:
             if not _is_valid_b64(b64_match):
                 continue
-            decoded = base64.b64decode(b64_match).decode('utf-8', errors='ignore')
-            if not re.search(r'[\x20-\x7E]{4,}', decoded):
-                continue
-            decoded_flags = FLAG_REGEX.findall(decoded)
-            for df in decoded_flags:
-                log_flag(df, f"Base64 Decoded ({b64_match[:24]}…) in {source_name}")
+            for layer, decoded in _b64_decode_layers(b64_match):
+                if not re.search(r'[\x20-\x7E]{4,}', decoded):
+                    continue
+                decoded_flags = FLAG_REGEX.findall(decoded)
+                for df in decoded_flags:
+                    tag = f"Base64 Decoded ({b64_match[:24]}…) in {source_name}" if layer == 1 \
+                        else f"Base64 x{layer} Decoded ({b64_match[:24]}…) in {source_name}"
+                    log_flag(df, tag)
         except Exception:
             pass
 

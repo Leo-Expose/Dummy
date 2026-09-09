@@ -30,7 +30,7 @@
     // UUIDs are hints, not flags (separate console group to cut noise)
     const UUID_REGEX = /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/gi;
 
-    const B64_CANDIDATE_REGEX = /[A-Za-z0-9+/]{16,}={0,2}/g;
+    const B64_CANDIDATE_REGEX = /[A-Za-z0-9+/]{8,}={0,2}/g;
 
     let discoveredFlags = new Map(); // key: flag string, value: { category, location, raw }
 
@@ -59,10 +59,17 @@
         return out;
     }
 
+    function padB64(s) {
+        while (s.length % 4 !== 0) s += '=';
+        return s;
+    }
+
     function isValidB64(s) {
-        if (s.length < 16 || s.length % 4 === 1) return false;
+        s = s.replace(/\s+/g, '');
+        if (s.length < 8 || s.length % 4 === 1) return false;
         try {
-            const dec = atob(s);
+            const padded = padB64(s);
+            const dec = atob(padded);
             // round-trip: re-encode must match (ignoring padding)
             const re = btoa(dec).replace(/=+$/, '');
             return re === s.replace(/=+$/, '');
@@ -71,21 +78,34 @@
         }
     }
 
-    // Helper: Extract Base64 encoded flags (validated round-trip only)
+    // Helper: Extract Base64 encoded flags (validated round-trip, up to 3 nested layers)
     function findBase64Flags(text) {
-        if (typeof text !== 'string' || text.length < 16) return [];
+        if (typeof text !== 'string' || text.length < 8) return [];
         const candidates = new Set(text.match(B64_CANDIDATE_REGEX) || []);
         const found = [];
 
+        const scanLayers = (token, depth, chain) => {
+            if (depth > 3) return;
+            if (!isValidB64(token)) return;
+            let decoded;
+            try {
+                decoded = atob(padB64(token.replace(/\s+/g, '')));
+            } catch (e) { return; }
+            if (!/[\x20-\x7E]{4,}/.test(decoded)) return;
+            const flags = decoded.match(flagRegex()) || [];
+            for (const flag of new Set(flags)) {
+                found.push({ flag, encoded: chain });
+            }
+            // nested layer: first valid token inside decoded output
+            const inner = new Set(decoded.match(B64_CANDIDATE_REGEX) || []);
+            for (const tok of inner) {
+                if (isValidB64(tok)) { scanLayers(tok, depth + 1, chain + ' > ' + tok.slice(0, 16) + '...'); break; }
+            }
+        };
+
         for (const candidate of candidates) {
             try {
-                if (!isValidB64(candidate)) continue;
-                const decoded = atob(candidate);
-                if (!/[\x20-\x7E]{4,}/.test(decoded)) continue;
-                const flags = decoded.match(flagRegex()) || [];
-                for (const flag of new Set(flags)) {
-                    found.push({ flag, encoded: candidate });
-                }
+                scanLayers(candidate, 1, candidate);
             } catch (e) {
                 // Not valid base64 or decode error
             }

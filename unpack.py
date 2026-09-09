@@ -84,13 +84,16 @@ def _pad_b64(s):
 def _valid_b64_roundtrip(s):
     """Require canonical base64 to kill false positives on English words."""
     try:
-        if len(s) < 16 or len(s) % 4 == 1:
+        s = re.sub(r'\s+', '', s)
+        if len(s) < 8 or len(s) % 4 == 1:
             return False
-        dec = base64.b64decode(s, validate=True)
+        dec = base64.b64decode(_pad_b64(s), validate=True)
         # re-encode must match (ignoring padding)
         return base64.b64encode(dec).decode().rstrip('=') == s.rstrip('=')
     except Exception:
         return False
+
+B64_TOKEN_REGEX = re.compile(r'[A-Za-z0-9+/]{8,}={0,2}')
 
 def _caesar_shifts(s):
     out = []
@@ -132,14 +135,29 @@ def decode_payload(data_str, depth=0, max_depth=5, _visited=None):
     _visited.add(h)
     scan_text(data_str, f"Decoder (Depth {depth})")
 
-    # 1. Base64 Decoding (with round-trip validation)
+    # 1. Base64 Decoding (whole string, with round-trip validation)
     try:
         s = re.sub(r'\s+', '', data_str)
         if _valid_b64_roundtrip(s):
-            b64_dec = base64.b64decode(s).decode('utf-8', errors='ignore')
+            b64_dec = base64.b64decode(_pad_b64(s)).decode('utf-8', errors='ignore')
             if b64_dec and b64_dec != data_str and re.search(r'[\x20-\x7E]{4,}', b64_dec):
                 scan_text(b64_dec, f"Base64 Decoded (Depth {depth+1})")
                 decode_payload(b64_dec, depth + 1, max_depth, _visited)
+    except Exception:
+        pass
+
+    # 1b. Base64 tokens embedded in larger text ("answer is Zmxh... here")
+    try:
+        for tok in set(B64_TOKEN_REGEX.findall(data_str)):
+            if not _valid_b64_roundtrip(tok):
+                continue
+            try:
+                tdec = base64.b64decode(_pad_b64(tok)).decode('utf-8', errors='ignore')
+            except Exception:
+                continue
+            if tdec and tdec != data_str and re.search(r'[\x20-\x7E]{4,}', tdec):
+                scan_text(tdec, f"Base64 Token (Depth {depth+1})")
+                decode_payload(tdec, depth + 1, max_depth, _visited)
     except Exception:
         pass
 

@@ -61,7 +61,7 @@ Mystery files with fake extensions, metadata, or appended payloads.
 ### ✨ Key Features
 - **Magic Byte Verification**: `PNG/JPEG/GIF/ZIP/7z/RAR/PDF/ELF/EXE/OGG/MP3/MPEG/RIFF/GZIP/BZIP2/SQLite/OLE/PCAP/PCAP-NG/XZ/Zstd`; warns on fake/missing extension.
 - **Metadata & EXIF**: `exiftool` (15s timeout) or `Pillow` `getexif()` + PNG text-chunk fallback.
-- **Strings**: system `strings` (15s timeout) or Python `[ -~]` fallback; Base64 hits require canonical round-trip.
+- **Strings**: system `strings` (15s timeout) or Python `[ -~]` fallback; Base64 hits require canonical round-trip (short, unpadded, and up to 3× nested layers all decoded).
 - **Trailing Payloads**: after PNG `IEND`, JPEG `EOI`, GIF `0x3B`, PDF `%%EOF`; carve capped at 50MB; embedded ZIP detection.
 - **Safety**: 200MB input cap (`--force` to override), `Image.MAX_IMAGE_PIXELS` guard.
 
@@ -115,7 +115,7 @@ Archives + multi-layer cipher decoding.
 - **Safe Extraction**: ZipSlip/TarSlip guards (rejects absolute paths, `..`, symlinks), per-file 50MB cap, 200MB total cap, compression-ratio guard.
 - **Passwords**: `-p`, `-w wordlist` (capped at 5000), auto-harvest from first 2MB of file; handles `RuntimeError` (bad password) + `NotImplementedError` (unsupported crypto).
 - **Recursion**: nested archives to `--max-depth 3` (default) with SHA256 loop guard.
-- **Ciphers** (recursive, cycle-guarded): Base64 (round-trip validated), Base32 (alphabet+length gated), Base85 (round-trip), Hex runs, Caesar-26 (recurse on flag hits), URL-decode (recurse), single-byte XOR brute (depth-0, flag hits only).
+- **Ciphers** (recursive, cycle-guarded): Base64 — whole-string, tokens embedded in larger text, short/unpadded/nested (round-trip validated), Base32 (alphabet+length gated), Base85 (round-trip), Hex runs, Caesar-26 (recurse on flag hits), URL-decode (recurse), single-byte XOR brute (depth-0, flag hits only).
 
 ### 🚀 Usage
 ```bash

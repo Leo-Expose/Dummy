@@ -46,7 +46,7 @@ STRICT_PREFIXES = r'(?:flag|ctf|picoCTF|HTB|THM|kju|CHTB|SEKAI|UIUCTF|PatriotCTF
 STRICT_FLAG_REGEX = re.compile(STRICT_PREFIXES + r'\{[^}\r\n]{1,200}\}', re.IGNORECASE)
 LOOSE_FLAG_REGEX = re.compile(r'[A-Za-z0-9_\-]{3,25}\{[A-Za-z0-9_\-!@#$%^&*()+=~`|:;\"\'<>,.?/\\ \[\]]{1,200}\}')
 FLAG_REGEX = STRICT_FLAG_REGEX
-B64_REGEX = re.compile(r'[A-Za-z0-9+/]{16,}={0,2}')
+B64_REGEX = re.compile(r'[A-Za-z0-9+/]{8,}={0,2}')
 
 # Comprehensive Binary Signatures for Carving (binwalk equivalent)
 FILE_SIGNATURES = [
@@ -82,14 +82,40 @@ def log_flag(flag, source):
     print(f"  {Colors.BOLD}{Colors.GREEN}🚩 FOUND FLAG:{Colors.RESET} {Colors.CYAN}{flag}{Colors.RESET}")
     print(f"     {Colors.YELLOW}Source:{Colors.RESET} {source}\n")
 
+def _pad_b64(s):
+    return s + '=' * ((-len(s)) % 4)
+
 def _is_valid_b64(s):
     try:
-        if len(s) < 16 or len(s) % 4 == 1:
+        s = re.sub(r'\s+', '', s)
+        if len(s) < 8 or len(s) % 4 == 1:
             return False
-        dec = base64.b64decode(s, validate=True)
+        dec = base64.b64decode(_pad_b64(s), validate=True)
         return base64.b64encode(dec).decode().rstrip('=') == s.rstrip('=')
     except Exception:
         return False
+
+def _b64_decode_layers(token, max_layers=3):
+    """Yield (layer, decoded_text) by recursively base64-decoding a token."""
+    seen = {token}
+    cur = token
+    for layer in range(1, max_layers + 1):
+        try:
+            txt = base64.b64decode(_pad_b64(cur), validate=True).decode('utf-8', errors='ignore')
+        except Exception:
+            break
+        yield layer, txt
+        if not re.search(r'[\x20-\x7E]{4,}', txt):
+            break
+        nxt = None
+        for cand in set(B64_REGEX.findall(txt)):
+            if cand not in seen and _is_valid_b64(cand):
+                nxt = cand
+                break
+        if nxt is None:
+            break
+        seen.add(nxt)
+        cur = nxt
 
 def scan_text_for_flags(text, source_tag):
     if not text:
@@ -97,15 +123,17 @@ def scan_text_for_flags(text, source_tag):
     for f in FLAG_REGEX.findall(text):
         log_flag(f, source_tag)
 
-    for b64 in B64_REGEX.findall(text):
+    for b64 in set(B64_REGEX.findall(text)):
         try:
             if not _is_valid_b64(b64):
                 continue
-            decoded = base64.b64decode(b64).decode('utf-8', errors='ignore')
-            if not re.search(r'[\x20-\x7E]{4,}', decoded):
-                continue
-            for df in FLAG_REGEX.findall(decoded):
-                log_flag(df, f"Base64 Decoded ({b64[:16]}...) in {source_tag}")
+            for layer, decoded in _b64_decode_layers(b64):
+                if not re.search(r'[\x20-\x7E]{4,}', decoded):
+                    continue
+                for df in FLAG_REGEX.findall(decoded):
+                    tag = f"Base64 Decoded ({b64[:16]}...) in {source_tag}" if layer == 1 \
+                        else f"Base64 x{layer} Decoded ({b64[:16]}...) in {source_tag}"
+                    log_flag(df, tag)
         except Exception:
             pass
 
@@ -185,15 +213,15 @@ def analyze_lsb_stego(filepath, verbose=False):
                         for f in flags_found:
                             log_flag(f, f"zsteg LSB Analysis -> {combo_tag}")
 
-                    # Check Base64 candidates inside LSB (validated only)
-                    for b64 in B64_REGEX.findall(text):
+                    # Check Base64 candidates inside LSB (validated, recursive layers)
+                    for b64 in set(B64_REGEX.findall(text)):
                         try:
                             if not _is_valid_b64(b64):
                                 continue
-                            decoded = base64.b64decode(b64).decode('utf-8', errors='ignore')
-                            for df in FLAG_REGEX.findall(decoded):
-                                bits_found_count += 1
-                                log_flag(df, f"Base64 in zsteg LSB Analysis -> {combo_tag}")
+                            for layer, decoded in _b64_decode_layers(b64):
+                                for df in FLAG_REGEX.findall(decoded):
+                                    bits_found_count += 1
+                                    log_flag(df, f"Base64 in zsteg LSB Analysis -> {combo_tag}")
                         except Exception:
                             pass
 

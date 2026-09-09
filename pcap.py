@@ -22,7 +22,7 @@ LOOSE_RE = re.compile(r'[A-Za-z0-9_\-]{3,25}\{[A-Za-z0-9_\-!@#$%^&*()+=~`|:;\"\'
 FLAG_RE = STRICT_RE
 
 UUID_RE = re.compile(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b')
-BASE64_RE = re.compile(r'[A-Za-z0-9+/]{16,}={0,2}')
+BASE64_RE = re.compile(r'[A-Za-z0-9+/]{8,}={0,2}')
 HEX_RUN_RE = re.compile(r'(?:[0-9a-fA-F]{2}[\s:]?){8,}')
 
 found_flags = []
@@ -50,23 +50,27 @@ def find_flags(text, source):
     for h in UUID_RE.findall(text):
         log_hint(h, source + " [uuid]")
 
+def _pad_b64(s):
+    return s + '=' * ((-len(s)) % 4)
+
 def _valid_b64(s):
     try:
-        if len(s) < 16 or len(s) % 4 == 1:
+        s = re.sub(r'\s+', '', s)
+        if len(s) < 8 or len(s) % 4 == 1:
             return False
-        dec = base64.b64decode(s, validate=True)
+        dec = base64.b64decode(_pad_b64(s), validate=True)
         return base64.b64encode(dec).decode().rstrip('=') == s.rstrip('=')
     except Exception:
         return False
 
 def try_base64(text, source):
-    if not text or len(text) < 16:
+    if not text or len(text) < 8:
         return
     for match in set(BASE64_RE.findall(text)):
         try:
             if not _valid_b64(match):
                 continue
-            decoded = base64.b64decode(match).decode('utf-8', errors='ignore')
+            decoded = base64.b64decode(_pad_b64(match)).decode('utf-8', errors='ignore')
             if re.search(r'[\x20-\x7E]{4,}', decoded):
                 find_flags(decoded, f"Base64 decoded from {source}")
         except Exception:
